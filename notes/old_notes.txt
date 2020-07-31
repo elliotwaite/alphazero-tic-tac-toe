@@ -1,0 +1,156 @@
+AlphaZero
+
+This is a summary of the AlphaZero algorithm presented in:
+
+Model: (p, v) = fθ(s)
+  f: neural network.
+  θ: parameters (initialized randomly).
+  s: state.
+  p: move probabilities.
+  v: probability of the current player winning (current player = next to move).
+
+
+MCTS:
+  node data: N(s, a), W(s, a), Q(s, a), P(s, a)
+    N: visit count.
+    W: sum over action values of descendant leaf nodes.
+    Q: average action value (W / N).
+    P: prior move probability (p from the neural network for the node's state).
+
+  run n simulations:
+
+    select action: a of argmax(Q(s, a) + U(s, a))
+      U(s, a): c P(s, a) * √(∑N(s, *)) / (1 + N(s, a))
+        c: constant determining level of exploration
+
+    if at leaf node:
+      if game has ended:
+        return v = z (game outcome).
+      else:
+        set N, W, Q to 0
+        run (p, v) = fθ(s)
+        set P to p
+        return v
+
+    update all traversed nodes:
+      N += 1
+      W += v
+      Q = W / N
+
+  after n simulations, select a move:
+    sample an action from the policy for first 30 moves:
+      π(s, a) = N(s, a) / ∑N(s, *)
+
+    act greedily after that:
+      max N
+
+  if the game has ended:
+    set z to game outcome.
+
+  else (if the game has not ended):
+    if the game has exceeded the max game length:
+      set z = v.
+    else:
+      repeat the simulations and move selection steps above.
+
+  when the game episode has ended, store the data for all played states:
+    (s, π, z)
+      s: state
+      π: MCTS policy
+      z: outcome of game (will be the same for all data from the same game).
+
+
+Train the model:
+  Loss: l = (z − v)^2 − π log p + c||θ||^2
+    z: actual outcome of simulated game [-1, 1]
+    π: MCTS move probabilities.
+    c: .0001 (L2 normalization factor)
+
+
+Hyperparameters:
+  Total steps: 700,000
+  Total games: 21 mil to 44 mil (30 to 60 games per step)
+  Train mini-batch size: 4096
+  Recent games pool: 500,000 (uniformly sampled from for mini-batches)
+  MCTS simulations per move: 800
+  MCTS leaf node queue mini-batch size: 8
+  Learning rates (decayed): .2, .02, .002, .0002
+  Dirichlet noise added to root node: (1 − ε) P(a) + ε D(α)
+    ε: .25
+    α: scaled inversely to the approximate number of legal moves.
+       0.3, 0.15, 0.03 for chess, shogi and Go respectively.
+
+
+Simple sequential version:
+  init model.
+  loop:
+    self-play n games with MCTS
+    train the model
+
+
+Parallel version:
+  init model.
+  parallel threads:
+    self-play thread: generate data with MCTS and most recent model.
+    train thread: optimize model with most recent data.
+      (wait till game pool is minimally populated.)
+
+model queue:
+  train queue: (s, π, z) -> nothing (train_op)
+  self-play queue: (s) -> (p, v)
+
+
+Instead of keeping visit count, total action value, and average action value,
+we could just keep visit count and average action value. When we get a new
+value:
+average_action_value = ((average_action_value * visit_count) + value) / (visit_count + 1)
+But this might be slower.
+
+
+Trying out different Tic Tac Toe display formats:
+
+3|X| |O|
+2|O|O|X|
+1|X| | |
+  a b c
+
+3   X |   | O
+   ---+---+---
+2   O | O | X
+   ---+---+---
+1   X |   |
+
+    a   b   c
+
+
+3   X │   │ O
+   ───┼───┼───
+2   O │ O │ X
+   ───┼───┼───
+1   X │   │
+
+    a   b   c
+
+
+3   ✕ │   │ ◯
+   ───┼───┼───
+2   ◯ │ ◯ │ ✕
+   ───┼───┼───
+1   ✕ │   │
+
+    a   b   c
+
+(plus colors)
+
+
+3  .99│.01│ ◯
+   ───┼───┼───
+2   ◯ │ ◯ │ ✕
+   ───┼───┼───
+1   ✕ │   │
+
+    a   b   c
+
+(plus colors)
+
+

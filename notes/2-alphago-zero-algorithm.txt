@@ -1,0 +1,190 @@
+AlphaGo Zero Algorithm
+
+Paper:
+https://www.nature.com/articles/nature24270.epdf?author_access_token=VJXbVjaSHxFoctQQ4p2k4tRgN0jAjWel9jnR3ZoTv0PVW4gB86EEpGqTRDtpIz-2rmo8-KG06gqVobU5NSCFeHILHcVFUeMsbvwS-lxjqQGg98faovwjxeTUgZAUMnRQ
+
+Overview:
+  The program is similar to AlphaGo, except for the following differences:
+    * Only a single neural network is used for both policy and value estimation.
+    * The network uses residual conv blocks with batch norms.
+    * L2 regularization is used.
+    * The network it randomly initialized and trained purely from self-play RL.
+    * Rollouts are no longer used.
+    * Leaf nodes are always expanded.
+    * Only raw board history is used as inputs to the networks.
+    * Only a single machine with 4 TPUs was used (it could have been
+      distributed, but a simpler search algorithm was chosen).
+
+  In 36 hours, AlphaGo Zero surpassed AlphaGo Lee, which was trained over
+  several months.
+
+  After 72 hours of training, AlphaGo Zero (on one machine with 4 TPUs)
+  defeated AlphaGo Lee (on many machines with 48 TPUs) by 100 games to 0.
+
+  A similar network trained solely on expert human play, ending up being better
+  than AlphaGo Zero at predicting expert human moves, but was defeated by
+  AlphaGo Zero within 24 of training, suggesting that AlphaGo Zero may be
+  learning a strategy that is qualitatively different than human play.
+
+  The MCTS params were selected using gaussian process optimization to optimize
+  self-play performance. This optimization was done on the result of a
+  preliminary run for the 20 block version, and was done on the result of the
+  20 block version for the 40 block version.
+
+Optimization:
+  * 19 CPU parameter servers.
+  * 64 GPU workers.
+  * Batch size per worker = 32
+  * Total mini-batch size = 2,048 (64 * 32)
+  * Mini-batch is sampled uniformly from all positions of most recent 500,000
+    games of self-play.
+  * Optimized by SGD with momentum (0.9) and learning rate annealing.
+  * Learning rate:
+      0.1 for steps 0 - 400
+      0.01 for steps 400 - 600
+      0.001 for steps > 600
+  * Loss = (z - v)^2 - pi * log(p) + c * ||theta||^2
+    (where z is the game result, v is the predicted result, pi is a vector of
+    the move probabilities after MCTS, p is the vector of predicted move
+    probabilities, c is the L2 regularization parameter (set to .001), and
+    theta is a vector of the model parameters. The cross-entropy and MSE losses
+    are weighted equally, which is reasonable because rewards are unit scaled,
+    r ∈ {−1, +1}).
+  * A new checkpoint is generated every 1,000 training steps.
+  * Each new checkpoint is evaluated against the current best policy, and if it
+    wins by more than 55% (to avoid selecting on noise alone), it becomes the
+    new best policy that is used for self-play data generation.
+  * The checkpoint evaluation process is:
+    * 400 games
+    * 1,600 simulations of MCTS per move
+    * The move with the max visit count is selected (this is done by using a
+      very small softmax temperature for the move probabilities).
+
+Each iteration of self-play:
+  * 25,000 games.
+  * 1,600 simulations of MCTS per move (~0.4 secs per search).
+  * Move selection temperature = 1 for first 30 moves of the game (moves are
+    selected proportional to their visit count), and then it is set to a very
+    small number (~0) for the rest of game (the move with the max visit count
+    is selected).
+  * Additional exploration is achieved by adding Dirichlet noise to the prior
+    probabilities in the root node, specifically:
+    P(s, a) = (1 − ε) * p_a + ε * η_a  [where η ∼ Dir(0.03) and ε = 0.25]
+    This noise ensures that all moves may be tried, but the search may still
+    overrule bad moves.
+  * To save computation, clearly lost games are resigned. The resignation
+    threshold is selected automatically to keep the fraction of false positives
+    (games that could have been won if AlphaGo had not resigned) below 5%.
+    To measure false positives, resignation is disabled in 10% of self-play.
+
+Training stats (20 res block version):
+  * 3 days
+  * 4.9 million games
+  * 1,600 simulations per each MCTS
+  * ~ 0.4 secs of thinking per move
+  * Parameters updated over 700,000 mini-batches of 2,048 positions each
+
+Training stats (40 res block version):
+  * 40 days
+  * 29 million games
+  * Parameters updated over 3.1 million mini-batches of 2,048 positions each
+
+Neural Network Architecture:
+  Input shape: 19 x 19 x 17
+  1 conv:
+    Conv 3x3, 256 filters, stride 1
+    Batch norm
+    ReLu
+  19 or 39 res conv blocks:
+    Conv 3x3, 256 filters, stride 1
+    Batch norm
+    ReLu
+    Conv 3x3, 256 filters, stride 1
+    Batch norm
+    A skip connection that adds the input to the block
+    ReLU
+  This is then split into a policy head and a value head.
+  The policy head:
+    Conv 1x1, 2 filters, stride 1
+    Batch norm
+    ReLU
+    Fully connected linear layer to 19 * 19 + 1 outputs
+    (19 * 19 + 1 = all board positions plus the pass move)
+  The value head:
+    Conv 1x1, 1 filter, stride 1
+    Batch Norm
+    ReLU
+    Fully connected linear layer of size 256
+    ReLU
+    Fully connected linear layer to 1 output
+    Tanh
+
+Neural Network Input Representation:
+  17 binary feature planes, each the size of the board (19 x 19):
+  * 8 planes for the current player's stones for the last 8 states (1 if the
+    current player had a stone there, 0 otherwise).
+  * 8 planes for the opponent's stones for the last 8 states (1 if the
+    opponent had a stone there, 0 otherwise).
+  * 1 plane for the current player's stone color (all 1s if black is to play,
+    all 0s if white is to play).
+
+  The past 8 states are need to observe repetitions, and the current color
+  plane is needed for komi (white is compensated for going second by being
+  given a certain number of extra points).
+
+
+MCTS:
+
+  Each node stores edges for all legal actions from that node.
+
+  Each edge stores:
+    P(s, a), prior probability
+    N(s, a), visit count
+    W(s, a), total action value
+    Q(s, a), mean action value
+
+  MCTS runs multiple simulations simultaneously on separate search threads,
+  perform the following steps for each simulation:
+
+  Select:
+    * Start from the root node, select child nodes using the following
+      algorithm (a variant of PUCT) until a leaf node is reached:
+        argmax over a of: Q(s, a) + U(s, a)
+        U(s, a) = c_puct * P(s, a) * sqrt(sum(N(s, *))) / (1 + N(s, a))
+    * As each edge is traversed, update it statistics with virtual losses to
+      encourage other threads to evaluate different paths:
+        N += n_vl
+        Q = W / N
+        (where n_vl is a parameter representing the number of games virtually
+        lost. It's value was not mentioned in the paper, but this value was set
+        to 3 for AlphaGo Han)
+
+  Expand and evaluate:
+    * Once a leaf node is reached, its state is add to an evaluation queue, and
+      the search thread is locked until evaluation is complete.
+    * Mini-batches of 8 states from the evaluation queue are processed at a
+      time. The states are randomly rotated and reflected before being passed
+      through the neural network, and then the outputs are mapped back into
+      their original orientation.
+    * When evaluation completes, the node is expanded, initializing the edges
+      to: P = the evaluated prior for this action, N = 0, W = 0, Q = 0
+
+  Backup:
+    * The estimated value (v) is backed up through all the traversed edges and
+      the virtual losses are removed:
+        N += 1 - n_vl
+        W += v
+        Q = N / W
+
+  Play:
+    * For the first 30 moves of the game, a move is selected proportional to:
+      N(s, a) / sum(N(s, *))
+      After the 30th move, the move with the max visit count is selected.
+    * The node for the chosen action becomes the new root node, and the rest of
+      the tree is discarded.
+    * AlphaGo Zero resigns if the root node and all child nodes have a
+      predicted lower than v_threshold.
+
+  Notes:
+    * A transposition table was used in the 40 block version so that edges that
+      resulted in the same state lead to the same node.

@@ -1,0 +1,344 @@
+MuZero Algorithm
+
+Paper:
+https://arxiv.org/pdf/1911.08265.pdf
+
+Training stats:
+  * 12 hours.
+  * 1 million mini-batches.
+  * Mini-batch size: 2048 (board games), 1024 (Atari)
+  * Simulations per MCTS step: 800 (board games), 50 (Atari)
+  * For Atari, MCTS is run every fourth time-step, and then the chosen action
+    is selected four times in a row.
+  * Training data is generated using the latest checkpoint (updated every 1,000
+    training steps).
+  * For board games, games are sent to the training job as soon as they finish.
+    Due to the much larger length of Atari games (up to 30 minutes or 108,000
+    frames), intermediate sequences are sent every 200 moves.
+  * In board games, the training job keeps an in-memory replay buffer of the
+    most recent 1 million games received; in Atari, where the visual
+    observations are larger, the most recent 125,000 sequences of length 200
+    are kept.
+  * For board games:
+      16 TPUs for training
+      1000 TPUs for self-play
+  * For each game in Atari:
+      8 TPUs for training
+      32 TPUs for self-play
+      (The much smaller proportion of TPUs used for acting in Atari is due to
+       the smaller number of simulations per move (50 instead of 800) and the
+       smaller size of the dynamics function compared to the representation
+       function.)
+  * All TPUs used were third-gen Google Cloud TPUs.
+
+Note: the "_t" appended to all symbols below, means "at time step t"
+      and "_T" means "at the terminal state."
+
+Model:
+  o_t = environment observation
+  s_t = encoded state
+  a_t = chosen action
+  r_t = predicted reward
+  p_t = predicted policy
+  v_t = predicted value
+
+  s_0 = h(o_1, ..., o_t)  "the representation function"
+  r_t, s_t = g(s_(t-1), a_t)  "the dynamics function"
+  p_t, v_t = f(s_t)  "the prediction function"
+
+  The above 3 functions can be summarized as:
+    p_t, v_t, r_t = m(o_1, ..., o_t, a_(t+1), ..., a_(t+k))  "the model"
+
+Search:
+  val_t = value from search
+  pi_t = policy from search
+  a_t = chosen action
+
+  val_t, pi_t = MCTS(s_t, u)
+  a_t ~ pi_t
+
+Learning Rule:
+  u_t = environment reward
+  z_t = return or discounted return
+
+  p_t, v_t, r_t = m(o_1, ..., o_t, a_(t+1), ..., a_(t+k))
+  For zero-sum games:
+    z_t = u_T
+  For general MDPs:
+    z_t = u_(t+1) + lambda * u_(t+2) + ... + lambda^(n-1) * u_(t+n) + lambda^n * val_(t+n)
+
+  loss_t = r_loss + v_loss + p_loss + l2_reg
+  For zero-sum games:
+    r_loss = 0
+    v_loss = (z - q)^2
+    p_loss = cross_ent(pi, p)
+  For general MDPs:
+    r_loss = cross_ent(u, r)
+    v_loss = cross_ent(z, q)
+    p_loss = cross_ent(pi, p)
+
+
+Neural Network Architectures:
+  They are similar to the models used for AlphaZero (and AlphaGo Zero) but with
+  varying numbers of res block.
+
+  16 res blocks for the representation function.
+  16 res blocks for the dynamics function.
+  20 res blocks for the prediction function.
+
+
+Atari Representation Network:
+  Input: 96 x 96, 128 planes (32 history frames of 3 color channels each,
+         concatenated with the corresponding 32 actions broadcast to planes).
+  1 Conv, 128 filters, stride 2 (downsampled to 48 x 48).
+  2 Res blocks, 128 filters.
+  1 Conv, 256 filters, stride 2 (downsampled to 24 x 24).
+  3 Res blocks, 128 filters.
+  1 Average pool, stride 2 (downsampled to 12 x 12).
+  3 Res blocks, 128 filters.
+  1 Average pool, stride 2 (downsampled to 6 x 6).
+
+  The kernel size is 3x3 for all operations.
+
+  (For res blocks details, see AlphaGo Zero notes.)
+
+  For the dynamics function (which always operates at the downsampled
+  resolution of 6x6), the action is first encoded as an image, then stacked
+  with the hidden state of the previous step along the plane dimension.
+
+
+MCTS:
+
+  Each node stores edges for all actions from that node.
+
+  Each edge stores:
+    N(s, a), visit count
+    Q(s, a), mean action value
+    P(s, a), policy
+    R(s, a), reward
+    S(s, a), state transition
+
+  Selection:
+    Starting from the root node, select actions until a leaf node is reached.
+    Each action that is selected should be the one that maximizes:
+      Q_normalized(s, a) + P(s, a) * sqrt(N(s)) / (1 + N(s, a)) * (c1 + log((N(s) + c2 + 1) / c2))
+
+    Q_normalized is Q normalized into the range of [0, 1]. This is done by
+    storing the min and max Q values observed so far in this search and using:
+      Q_normalized = (Q - Q_min) / (Q_max / Q_min)
+
+    N(s) is the parent node visit count.
+
+    c1 and c2 are used to control the influence of the prior P(s, a) relative
+    to the value Q(s, a) as nodes are visited more often. MuZero used:
+      c1 = 1.25
+      c2 = 19652.
+
+    For board games, additional exploration is achieved by adding Dirichlet
+    noise to the prior probabilities in the root node, specifically:
+      P(s, a) = (1 − ε) * p_a + ε * η_a
+      η ∼ Dir(α)
+      α = approximate number of legal moves in a typical position:
+          0.3 (chess), 0.15 (shogi), 0.03 (Go)
+      ε = 0.25
+
+    When a non-leaf action is selected, the next state and reward are looked up
+    from the transition table and reward table.
+
+  Expansion:
+    Once a leaf node is reached, evaluate its state and reward and using the
+    dynamics function and store them in the transition table and reward table.
+
+    Next, evaluate the policy and value using the prediction function, and
+    initialize each edge to: N = 0, Q = 0, P = policy, R = null, S = null.
+
+  Backup:
+    Update the statistics for each edge traversed:
+      N += 1
+      G = the cumulative discounted reward at that step
+          (r_0 + lambda * r_1 + lambda^2 * r_2 + ... + lambda^t * v)
+          where lambda = 0.997
+      Q = (N * Q + G) / (N + 1)
+
+  Play:
+    For board games, for the first 30 moves of the game, the next move is
+    selected proportional to:
+      N(s, a) / sum(N(s, *))
+    After the 30th move, the move with the max visit count is selected.
+
+    For Atari, all moves are selected proportional to:
+      N(s, a)^(1/T) / sum(N(s, *)^(1/T))
+    Where T (temperature) is decayed with the number of training steps:
+      T = 1 (initially)
+      T = 0.5 (after 500 k steps)
+      T = 0.25 (after 750 k steps)
+    This ensures that the action selection becomes greedier as training
+    progresses.
+
+    During evaluation, the action with the highest visit count is always chosen
+    for both board games and Atari.
+
+    The node for the chosen action becomes the new root node, and the rest of
+    the tree is discarded.
+
+
+State Representation:
+
+  Go and shogi:
+    The last 8 board states (as in AlphaZero).
+
+  Chess:
+    The last 100 board states (to allow correct prediction of draws).
+
+  Atari:
+    The last 32 RGB frames (96 x 96) and the last 32 actions that led to those
+    frames. The actions were added because unlike board games, an action in
+    Atari does not necessarily have a visible effect on the observation.
+    RGB frames are encoded as one plane per color, rescaled to [0, 1] (no other
+    normalization, whitening or other preprocessing of the RGB input).
+    Actions are encoded as simple bias planes, scaled as a/18 (there are 18
+    total actions in Atari).
+
+
+Dynamics Function:
+
+  The input to the dynamics function is the hidden state produced by the
+  representation function or previous application of the dynamics function,
+  concatenated with a representation of the action for the transition. Actions
+  are encoded spatially in planes of the same resolution as the hidden state.
+  In Atari, this resolution is 6x6, in board games this is the same as the
+  board size (19x19 for Go, 8x8 for chess, 9x9 for shogi).
+
+  In Go, a normal action is encoded as an all zero plane, with a single 1 in the
+  position of the played stone. A pass is encoded as an all zero plane.
+
+  In chess, 8 planes are used to encode the action. The first one-hot plane
+  encodes which position the piece was moved from. The next two planes encode
+  which position the piece was moved to: a one-hot plane to encode the target
+  position, if on the board, and a second binary plane to indicate whether the
+  target was valid (on the board) or not. This is necessary because for
+  simplicity the policy action space enumerates a superset of all possible
+  actions, not all of which are legal, and the same action space is used for
+  policy prediction and to encode the dynamics function input. The remaining
+  five binary planes are used to indicate the type of promotion, if any (queen,
+  knight, bishop, rook, none).
+
+  The encoding for shogi is similar, with a total of 11 planes.The first 8
+  planes are used to indicate where the piece moved from - either a board
+  position (first one-hot plane) or the drop of one of the seven types of
+  prisoner (remaining 7 binary planes). The next two planes are used to encode
+  the target as in chess. The remaining binary plane indicates whether the move
+  was a promotion or not.
+
+  In Atari, an action is encoded as a one hot vector which is tiled
+  appropriately into planes.
+
+
+Prediction Function:
+
+  To predict the value (from the prediction function) and the reward (from the
+  dynamics function) a softmax of size 601 is used for each. These 601 value
+  are for the integer values in the range [-300, 300] inclusive. However, the
+  reward and value targets are scaled before being compared against this range
+  using this function:
+    sign(x)(sqrt(|x| + 1 - 1 + ε * x)
+    Where ε = 0.001
+
+  And if the scaled value falls between two integers, it's value is linearly
+  interpolated between those two integers. For example, if the scaled target
+  was 3.7, the softmax target corresponding to 3 would be 0.3 and the softmax
+  target corresponding to 4 would be 0.7 (with all other softmax target values
+  being 0).
+
+  When the values are used for inference (during MCTS), the expected value is
+  computed from the softmax outputs, and it is unscaled using the inverse of
+  the above scaling function.
+
+  Scaling and transformation of the value and reward happens transparently on
+  the network side and is not visible to the rest of the algorithm.
+
+
+Training:
+
+  A state is sampled from any game in the replay buffer.
+
+  In Atari, prioritized replay sampling is used, with a sample probability of:
+    P(s) = p(s) / sum(p(*))
+    Where p(s) = |v - z|
+    where v is the search value and z is the n-step return
+  To correct for the sampling bias, the loss is scaled with importance sampling
+  by weighing the loss proportional to 1/P(s).
+
+  For board games, states are sampled uniformly.
+
+  The state is then unrolled K steps into the future (K = 5 was used). Terminal
+  states are treated as absorbing states (the network is expected to always
+  predict the same value).
+
+  We take the initial obs and for each unrolled step we get the MCTS targets of
+  policy (p_t), estimated value (v_t), and estimated reward (r_t). We compare
+  these to the networks generated policy, value, and reward and each step to
+  get our loss.
+
+  In board games without intermediate rewards, the reward prediction loss is
+  omitted.
+
+  For board games, the estimated value is bootstrapped directly to the end of
+  the game, equivalent to predicting the final outcome. For Atari the
+  estimated value is bootstrapped for n = 10 steps into the future.
+
+  The loss of each head is scaled by 1/K to keep the loss similar with
+  different K values.
+
+  The gradient at the start of the dynamics function is scaled by 1/2 to keep
+  the total gradient applied to the dynamics function constant (because it
+  takes in the gradient from the next call to the dynamics function plus the
+  loss for the reward).
+
+  To improve the learning process and bound the activations, the hidden state
+  is scaled to the same range as the action input ([0, 1]):
+    s_scaled = (s − min(s)) / (max(s) − min(s))
+
+
+MuZero Reanalyze (a sample efficient variant) made the following changes:
+
+    Revisits past time steps and re-executes its search using the latest model
+    potentially resulting in better quality policy than the original search.
+    This fresh policy is used as the policy target for 80% of updates during
+    MuZero training.
+
+    The latest parameters is used by a value network to provide a fresher,
+    stable n-step bootstrapped target for the value function. Also, the n-step
+    return was reduced to n = 5 steps instead of n = 10 steps.
+
+    2.0 samples were drawn per state instead of 0.1 (to increase sample reuse).
+
+    The value target was weighted down to 0.25 compared to weights of 1.0 for
+    policy and reward targets (to avoid overfitting the value function).
+
+
+In Go, MuZero slightly exceeded the performance of AlphaZero, despite using
+less computation per node in the search tree (16 res blocks per evaluation
+in MuZero compared to 20 blocks in AlphaZero). This suggests that MuZero may be
+caching its computation in the search tree and using each additional
+application of the dynamics model to gain a deeper understanding of the
+position.
+
+In Atari evaluation, 200 million frames of experience were used per game, and a
+limit of 30 minutes or 108,000 frames per episode. Also, in order to mitigate
+the effects of the deterministic nature of the Atari simulator, two different
+evaluation strategies were employed: at the start of the episode, a random
+number (between 0 and 30) of random actions actions were applied to the
+simulator before handing over control to the agent, or start positions were
+sampled from human expert play to initialize the Atari simulator before handing
+over control to the agent.
+
+In Atari, more simulations improved performance, but not as much as in Go and
+seemed to plateau after 100 simulations (presumably due model inaccuracy in
+Atari). By the end of training, MuZero performed well even just selecting moves
+solely from the raw policy, suggesting that, by the end of training, the raw
+policy has learned to internalise the benefits of search.
+
+Surprisingly, MuZero can learn effectively even when training with fewer
+simulations per move, such as 6 or 7, than are enough to cover all 8 possible
+actions in Ms. Pacman.

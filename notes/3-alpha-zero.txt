@@ -1,0 +1,69 @@
+AlphaGo Zero Algorithm
+
+Paper:
+https://kstatic.googleusercontent.com/files/2f51b2a749a284c2e2dfa13911da965f4855092a179469aedd15fbe4efe8f8cbf9c515ef83ac03a6515fa990e6f85fd827dcd477845e806f23a17845072dc7bd
+
+Overview:
+  The program is similar to AlphaGo Zero, except for the following differences:
+    * Ties were added (v = 0), and instead of being optimized to win, it is now
+      optimized to maximize the expected outcome value (meaning it could favor
+      going for a safe tie instead of a risky win).
+    * Data augmentation (rotations and reflections) is no longer used during
+      MCTS or training.
+    * The neural network is updated continually instead of in iterations that
+      would require a 55% win rate, and the latest model is always used for
+      self-play.
+    * Instead of using Bayesian optimization to determine the hyperparameters,
+      the same hyperparameters and algorithm settings are used for all games
+      without game specific tuning (except for the exploration noise and
+      learning rate schedule).
+
+The new U(s, a):
+  * U(s, a) = C(s) * P(s, a) * sqrt(N(s)) / (1 + N(s, a))
+  * Instead of using sum(N(s, *)), just use the parent visit count (N(s))
+    (which is equivalent but more efficient).
+  * C(s) is the exploration rate, which grows slowly with search time:
+    C(s) = log ((1 + N(s) + c_base) / c_base) + c_init
+    (but is essentially constant during the fast training games).
+
+Dirichlet noise Dir(α) was added to the prior probabilities in the root node.
+It was scaled in inverse proportion to the approximate number of legal moves
+in a typical position: 0.3 (chess), 0.15 (shogi), 0.03 (Go).
+
+Training:
+  * 700,000 mini-batches
+  * 4,096 training positions per mini-batch
+  * 800 simulations per each MCTS
+  * Training times: 9 hours (chess), 12 hours (shogi), 13 days (Go)
+  * Training games: 44 mill (chess), 24 mill (shogi), 140 mill (Go)
+  * Time per move: ~ 40 ms (chess), ~ 90 ms (shogi), ~ 200 ms (Go)
+  * Eval positions per sec: 63 k (chess), 58 k (shogi), 16 k (Go)
+  * Eval Flops: 1.5 GFlops (chess), 1.9 GFlops (shogi), 8.5 GFlops (Go)
+  * LR was set at the following stages of training:
+      step 0: 0.2
+      step 100k: 0.02
+      step 300k: 0.002
+      step 500k: 0.0002
+  * Compute for training:
+      5,000 first-gen TPUs were used for generating self-play games.
+      16 second-gen TPUs were used for training.
+  * Compute when comparing to other engines:
+      4 first-gen TPUs and 44 CPU cores.
+
+Early termination:
+  * Chess and shogi games exceeding 512 steps were terminated and assigned a
+    drawn outcome.
+  * Go games exceeding 722 steps were terminated and scored with Tromp-Taylor
+    rules.
+
+During evaluation, the move with the highest visit count was selected.
+
+AlphaZero used a simple time control strategy: thinking for 1/20th of the
+remaining time.
+
+A version of AlphaZero for Go that used data augmentation (rotations and
+reflections) advanced slower per training step, but was able to be trained much
+faster (wall clock time) because it generated 8 times as much data per game.
+
+The state was represented the same for Go as AlphaGo Zero. See the paper for
+the state representations used for chess and shogi.
